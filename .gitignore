@@ -1,0 +1,19 @@
+# Secrets — never committed
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+env/
+.venv/
+
+# Runtime state (lives on server, not in git)
+*.pid
+*.log
+battery_state.json
+
+# OS
+.DS_Store
+Thumbs.db
