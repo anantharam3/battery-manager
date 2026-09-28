@@ -409,17 +409,34 @@ def run_calibration(cycles_target: int = 3) -> None:
         phase       = state["phase"]
         ct          = state["cycles_target"]
 
-        # Dell EC caps charging at ~89-90% (hardware policy, not exposed via sysfs).
-        # charge_full_design (6491 mAh) is never reached — EC stops at ~5810 mAh.
-        # Detect "at full" when: status is Full, OR the EC has stopped charging
-        # (Not charging AND cap >= 85% AND zero power draw = no active current).
+        # ── Detect "at full" ───────────────────────────────────────────────
+        # Four conditions cover all Dell EC / BMS combinations:
+        #  1. BMS declares "Full" explicitly
+        #  2. EC charge ceiling (BIOS Adaptive): "Not charging" + 0W draw at >=85%
+        #  3. Trickle done: 100% + <0.5W draw (BMS says Charging but nearly done)
+        #  4. Stuck-trickle timeout: 100% for >= 60 min (Dell ECs that never
+        #     drop power to near-zero — belt-and-suspenders fallback)
+        # Note: BIOS is now Standard — full 6491 mAh is reachable (not 5810 mAh).
+
+        # Track when we first reach 100% in charging phase (for condition 4).
+        # Must write to disk immediately — state_read() at loop top overwrites in-memory state.
+        if cap >= 100 and phase == "charging":
+            if not state.get("at_full_since"):
+                state["at_full_since"] = datetime.now().isoformat()
+                state_write(state)
+
+        mins_at_full = 0.0
+        if state.get("at_full_since"):
+            mins_at_full = (
+                datetime.now() - datetime.fromisoformat(state["at_full_since"])
+            ).total_seconds() / 60
+
         at_full = (
-            bst == "Full"
-            or (
-                bst == "Not charging"
-                and cap >= 85
-                and bat["power_w"] == 0.0
-            )
+            bst == "Full"                                              # 1
+            or (bst == "Not charging" and cap >= 85                   # 2
+                and bat["power_w"] == 0.0)
+            or (cap >= 100 and bat["power_w"] < 0.5)                 # 3
+            or (cap >= 100 and mins_at_full >= 60)                   # 4
         )
 
         log.info(
@@ -483,10 +500,14 @@ def run_calibration(cycles_target: int = 3) -> None:
 
             # BMS reports Full (or "Not charging" at charge_full on Dell) — calibration point
             if at_full:
-                full_reason = (
-                    "BMS Full" if bst == "Full"
-                    else f"EC charge ceiling @ {cap}% ({charge_now//1000} mAh, 0W draw)"
-                )
+                if bst == "Full":
+                    full_reason = "BMS Full"
+                elif bst == "Not charging":
+                    full_reason = f"EC ceiling @ {cap}% ({charge_now//1000} mAh, 0W)"
+                elif bat["power_w"] < 0.5:
+                    full_reason = f"Trickle done @ {cap}% ({charge_now//1000} mAh, {bat['power_w']}W)"
+                else:
+                    full_reason = f"Timeout @ {cap}% — {int(mins_at_full)}min at full, {bat['power_w']}W"
                 log.info(f"Cycle {cycle}: {full_reason}! Resting {CFG['CALIB_REST_MINUTES']} min...")
                 tg_send(
                     f"✅ *Cycle {cycle}/{ct}: Charge Complete!*\n"
@@ -524,10 +545,11 @@ def run_calibration(cycles_target: int = 3) -> None:
                 else:
                     # ── Start next cycle ──────────────────────────────────────
                     cycle += 1
-                    state["cycle"]                = cycle
-                    state["phase"]                = "discharging"
+                    state["cycle"]                  = cycle
+                    state["phase"]                  = "discharging"
                     state["discharge_alerts_fired"] = []
                     state["charge_alerts_fired"]    = []
+                    state.pop("at_full_since", None)   # clear — don't bleed into next cycle
                     state_write(state)
                     plug_off(f"cycle {cycle} — starting discharge")
                     tg_send(
