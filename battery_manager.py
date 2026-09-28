@@ -89,7 +89,7 @@ CFG = {
     # Calibration settings
     "CALIB_LOW_PCT":         5,     # Plug ON when discharge reaches this %
     "CALIB_CYCLES":          3,     # Default number of calibration cycles
-    "CALIB_REST_MINUTES":   60,     # Minutes to rest at BMS Full between cycles
+    "CALIB_REST_MINUTES":   10,     # Minutes to rest at BMS Full between cycles (10 is sufficient for cell settling)
 
     # Alerts
     "ALERT_INTERVAL_HOURS":  1,     # Hourly status alert in daemon mode
@@ -330,6 +330,7 @@ def state_write(data: dict) -> None:
         log.info(f"State saved: {data}")
     except OSError as e:
         log.error(f"state_write FAILED ({e}) — calibration state NOT persisted! Disk full or permissions issue?")
+        raise  # Re-raise: fail at the right call site with the real error, not a KeyError one tick later
 
 
 def state_clear() -> None:
@@ -645,7 +646,7 @@ def _handle_command(text: str) -> str:
         return (
             "🛑 *Battery Manager stopping...*\n"
             "Plug left in current state. Script will exit within 60s.\n"
-            "Restart: `nohup python3 ~/projects/battery_manager_v3.py >> /data/battery_manager.log 2>&1 &`"
+            "Restart: `nohup python3 ~/battery_manager_git/battery_manager.py >> /data/battery_manager.log 2>&1 &`"
         )
 
     elif cmd == "/ps":
@@ -794,7 +795,7 @@ def run_daemon() -> None:
 
             if _stop_requested.is_set():
                 log.info("🛑 /stop received — daemon loop exiting cleanly.")
-                tg_send("🛑 *Battery Manager stopped.*\nRestart with: `nohup python3 ~/projects/battery_manager_v3.py >> /data/battery_manager.log 2>&1 &`")
+                tg_send("🛑 *Battery Manager stopped.*\nRestart with: `nohup python3 ~/battery_manager_git/battery_manager.py >> /data/battery_manager.log 2>&1 &`")
                 sys.exit(0)
 
             time.sleep(CFG["POLL_INTERVAL"])
