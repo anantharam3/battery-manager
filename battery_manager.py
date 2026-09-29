@@ -118,20 +118,25 @@ DESIGN_MAH = 6491   # Dell Inspiron 7559 new battery design capacity
 # SMART PLUG  (Tuya local control)
 # ══════════════════════════════════════════════════════════════════════════════
 def _plug() -> tinytuya.OutletDevice:
-    p = tinytuya.OutletDevice(CFG["TUYA_ID"], CFG["TUYA_IP"], CFG["TUYA_KEY"])
-    p.set_version(CFG["TUYA_VER"])
-    p.set_socketTimeout(5)
-    return p
+    if not hasattr(_plug, "instance"):
+        _plug.instance = tinytuya.OutletDevice(CFG["TUYA_ID"], CFG["TUYA_IP"], CFG["TUYA_KEY"])
+        _plug.instance.set_version(CFG["TUYA_VER"])
+        _plug.instance.set_socketTimeout(3)
+    return _plug.instance
 
 
 def plug_on(reason: str = "") -> bool:
     for attempt in range(3):
         try:
-            _plug().turn_on()
+            res = _plug().turn_on()
+            if isinstance(res, dict) and "Error" in res:
+                log.warning(f"plug_on attempt {attempt+1}/3 failed: {res['Error']}")
+                time.sleep(2)
+                continue
             log.info(f"⚡ Plug ON{' — ' + reason if reason else ''}")
             return True
         except Exception as e:
-            log.warning(f"plug_on attempt {attempt+1}/3 failed: {e}")
+            log.warning(f"plug_on attempt {attempt+1}/3 exception: {e}")
             time.sleep(2)
     log.error("plug_on: all retries failed")
     return False
@@ -140,11 +145,15 @@ def plug_on(reason: str = "") -> bool:
 def plug_off(reason: str = "") -> bool:
     for attempt in range(3):
         try:
-            _plug().turn_off()
+            res = _plug().turn_off()
+            if isinstance(res, dict) and "Error" in res:
+                log.warning(f"plug_off attempt {attempt+1}/3 failed: {res['Error']}")
+                time.sleep(2)
+                continue
             log.info(f"🔌 Plug OFF{' — ' + reason if reason else ''}")
             return True
         except Exception as e:
-            log.warning(f"plug_off attempt {attempt+1}/3 failed: {e}")
+            log.warning(f"plug_off attempt {attempt+1}/3 exception: {e}")
             time.sleep(2)
     log.error("plug_off: all retries failed")
     return False
@@ -479,11 +488,11 @@ def run_calibration(cycles_target: int = 3) -> None:
         elif phase == "charging":
 
             # Safety: ensure plug is still ON.
-            # Only intervene if plug is DEFINITELY OFF (False).
-            # If None (Tuya unreachable / network blip), do NOT force-toggle
-            # — battery may still be charging fine via the physical connection.
-            if plug_state() is False:
-                plug_on("calibration charging — plug confirmed OFF, turning back ON")
+            # If plug is DEFINITELY OFF (False), turn it on.
+            # If Tuya is unreachable (None), but laptop is draining, force it ON.
+            ps = plug_state()
+            if ps is False or (ps is None and bat["status"] not in ("Charging", "Full") and cap < 95):
+                plug_on("calibration charging — safety check: plug OFF or laptop discharging, forcing ON")
 
             # Charge threshold alerts (fires once per level)
             fired = state.get("charge_alerts_fired", [])
@@ -682,7 +691,8 @@ def _handle_command(text: str) -> str:
             for l in lines:
                 parts = l.split(None, 10)
                 if len(parts) >= 11:
-                    rows.append(f"`{parts[1]:>5}` {float(parts[2]):4.1f}% {parts[10][:35]}")
+                    safe_proc = parts[10][:35].replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("`", "")
+                    rows.append(f"`{parts[1]:>5}` {float(parts[2]):4.1f}% {safe_proc}")
             return "📊 *Top Processes (by CPU)*\n" + "\n".join(rows)
         except Exception as e:
             return f"❌ ps failed: {e}"
@@ -794,8 +804,8 @@ def run_daemon() -> None:
             # This is consistent with the calibration charging phase logic.
             sym = "⚡" if plugs is True else "🔌" if plugs is False else "❓"
             if cap <= low:
-                if plugs is False:
-                    plug_on(f"battery {cap}% ≤ LOW {low}%")
+                if plugs is False or (plugs is None and bat["status"] not in ("Charging", "Full")):
+                    plug_on(f"battery {cap}% ≤ LOW {low}% (safety force ON)")
                 elif plugs is None:
                     log.warning(f"🔋 {cap}% ≤ LOW — Tuya unreachable, plug state unknown, skipping toggle")
                 else:
@@ -941,6 +951,13 @@ if __name__ == "__main__":
             sys.exit(1)
 
         try:
+            log.info("Testing Tuya plug connection...")
+            if plug_state() is None:
+                log.warning("Tuya plug is currently UNREACHABLE! Check IP, Wi-Fi, and router settings.")
+                tg_send("⚠️ *Startup Warning*\nTuya smart plug is unreachable! Check network connection.")
+            else:
+                log.info("Tuya plug connection OK.")
+
             # Start telegram listener for all long-running modes
             threading.Thread(target=telegram_listener_thread, daemon=True).start()
 
