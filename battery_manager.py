@@ -50,6 +50,13 @@ import threading
 from pathlib import Path
 from datetime import datetime
 
+
+# ── Graceful exit signal (used instead of sys.exit inside loop functions
+#    so the PID-lock finally: block in __main__ always executes) ─────────────
+class _GracefulExit(SystemExit):
+    """Raised by /stop, /shutdown, /reboot handlers to exit cleanly."""
+    pass
+
 import requests
 import tinytuya
 from dotenv import load_dotenv
@@ -125,7 +132,7 @@ def _plug() -> tinytuya.OutletDevice:
     return _plug.instance
 
 
-def plug_on(reason: str = "") -> bool:
+def plug_on(reason: str = "", notify: bool = True) -> bool:
     for attempt in range(3):
         try:
             res = _plug().turn_on()
@@ -134,6 +141,9 @@ def plug_on(reason: str = "") -> bool:
                 time.sleep(2)
                 continue
             log.info(f"⚡ Plug ON{' — ' + reason if reason else ''}")
+            if notify:
+                bat = battery()
+                tg_send(f"⚡ *Plug ON*{' — ' + reason if reason else ''}\nBattery: {bat['cap']}% | {bat['power_w']}W")
             return True
         except Exception as e:
             log.warning(f"plug_on attempt {attempt+1}/3 exception: {e}")
@@ -142,7 +152,7 @@ def plug_on(reason: str = "") -> bool:
     return False
 
 
-def plug_off(reason: str = "") -> bool:
+def plug_off(reason: str = "", notify: bool = True) -> bool:
     for attempt in range(3):
         try:
             res = _plug().turn_off()
@@ -151,6 +161,9 @@ def plug_off(reason: str = "") -> bool:
                 time.sleep(2)
                 continue
             log.info(f"🔌 Plug OFF{' — ' + reason if reason else ''}")
+            if notify:
+                bat = battery()
+                tg_send(f"🔌 *Plug OFF*{' — ' + reason if reason else ''}\nBattery: {bat['cap']}% | {bat['power_w']}W")
             return True
         except Exception as e:
             log.warning(f"plug_off attempt {attempt+1}/3 exception: {e}")
@@ -373,15 +386,7 @@ def run_calibration(cycles_target: int = 3) -> None:
         }
         state_write(state)
         log.info(f"=== Calibration START: {cycles_target} cycles ===")
-        plug_off("calibration start — beginning discharge cycle 1")
-        tg_send(
-            f"🔋 *Battery Calibration Started*\n"
-            f"Target: {cycles_target} full cycles\n"
-            f"Cycle 1/{cycles_target}: DISCHARGING\n"
-            f"Charger OFF. Natural idle discharge to {CFG['CALIB_LOW_PCT']}%.\n"
-            f"At {CFG['CALIB_LOW_PCT']}%: auto plug ON → charge to BMS Full → plug OFF → repeat.\n"
-            f"Server stays ON throughout. Fully automated ✅"
-        )
+        plug_off("calibration start — beginning discharge cycle 1", notify=False)
     else:
         # ── Resume after unexpected reboot ────────────────────────────────────
         cycle         = state["cycle"]
@@ -389,17 +394,9 @@ def run_calibration(cycles_target: int = 3) -> None:
         cycles_target = state["cycles_target"]
         log.info(f"=== Calibration RESUMED: cycle {cycle}/{cycles_target}, phase={phase} ===")
         if phase == "discharging":
-            plug_off("calibration resume — still discharging")
-            tg_send(
-                f"🔄 *Calibration Resumed* (Cycle {cycle}/{cycles_target})\n"
-                f"Phase: DISCHARGING → monitoring to {CFG['CALIB_LOW_PCT']}%"
-            )
+            plug_off("calibration resume — still discharging", notify=False)
         elif phase == "charging":
-            plug_on("calibration resume — charging")
-            tg_send(
-                f"🔄 *Calibration Resumed* (Cycle {cycle}/{cycles_target})\n"
-                f"Phase: CHARGING → monitoring until BMS reports Full"
-            )
+            plug_on("calibration resume — charging", notify=False)
 
     # Clear any stale /calibrate start flag — prevents an unintended extra run
     # when calibration finishes and daemon mode resumes.
@@ -461,7 +458,7 @@ def run_calibration(cycles_target: int = 3) -> None:
             if cap <= CFG["CALIB_LOW_PCT"]:
                 # Low point reached — plug ON, switch phase (no shutdown!)
                 log.info(f"Low point {cap}% reached — plug ON, switching to charging")
-                plug_on(f"cycle {cycle} — low point reached, auto charging")
+                plug_on(f"cycle {cycle} — low point reached, auto charging", notify=False)
                 state["phase"]               = "charging"
                 state["charge_alerts_fired"] = []
                 state_write(state)
@@ -529,17 +526,17 @@ def run_calibration(cycles_target: int = 3) -> None:
                 _rest_end = time.time() + CFG["CALIB_REST_MINUTES"] * 60
                 while time.time() < _rest_end:
                     if _stop_requested.is_set():
-                        log.info("🛑 /stop received during rest — exiting cleanly.")
+                        log.info("\U0001f6d1 /stop received during rest — exiting cleanly.")
                         tg_send(
-                            "🛑 *Stopped during rest phase.*\n"
+                            "\U0001f6d1 *Stopped during rest phase.*\n"
                             "State saved — restart script to resume calibration."
                         )
-                        sys.exit(0)
+                        raise _GracefulExit(0)
                     time.sleep(min(60, max(0, _rest_end - time.time())))
 
                 if cycle >= ct:
                     # ── All cycles complete ───────────────────────────────────
-                    plug_off("calibration complete")
+                    plug_off("calibration complete", notify=False)
                     state_clear()
                     tg_send(
                         f"🎉 *Battery Calibration COMPLETE!*\n"
@@ -560,7 +557,7 @@ def run_calibration(cycles_target: int = 3) -> None:
                     state["charge_alerts_fired"]    = []
                     state.pop("at_full_since", None)   # clear — don't bleed into next cycle
                     state_write(state)
-                    plug_off(f"cycle {cycle} — starting discharge")
+                    plug_off(f"cycle {cycle} — starting discharge", notify=False)
                     tg_send(
                         f"🔌 *Cycle {cycle}/{ct}: DISCHARGING*\n"
                         f"Charger OFF. Discharging to {CFG['CALIB_LOW_PCT']}%."
@@ -569,7 +566,7 @@ def run_calibration(cycles_target: int = 3) -> None:
         if _stop_requested.is_set():
             log.info("🛑 /stop received — calibration loop exiting cleanly.")
             tg_send("🛑 *Battery Manager stopped* (calibration paused).\nCalibration state saved — will resume on next start.")
-            sys.exit(0)
+            raise _GracefulExit(0)
 
         time.sleep(CFG["POLL_INTERVAL"])
 
@@ -625,11 +622,11 @@ def _handle_command(text: str) -> str:
         return status_msg()
 
     elif cmd == "/plug on":
-        plug_on("Telegram command")
+        plug_on("Telegram command", notify=False)
         return "⚡ Plug turned *ON* via Telegram"
 
     elif cmd == "/plug off":
-        plug_off("Telegram command")
+        plug_off("Telegram command", notify=False)
         return "🔌 Plug turned *OFF* via Telegram"
 
     elif cmd.startswith("/set low "):
@@ -783,7 +780,9 @@ def run_daemon() -> None:
         f"Send `/help` for commands ✅"
     )
 
-    last_alert = datetime.min
+    last_alert          = datetime.min
+    plug_fail_count     = 0          # consecutive plug_state() None returns
+    last_plug_alert     = datetime.min  # rate-limit unreachable alerts
 
     while True:
         try:
@@ -798,6 +797,22 @@ def run_daemon() -> None:
             plugs = plug_state()
             low   = CFG["LOW_THRESHOLD"]
             high  = CFG["HIGH_THRESHOLD"]
+
+            # ── Bug 5: Track plug unreachability and alert ─────────────────────
+            if plugs is None:
+                plug_fail_count += 1
+                mins_since_plug_alert = (datetime.now() - last_plug_alert).total_seconds() / 60
+                if plug_fail_count >= 3 and mins_since_plug_alert >= 30:
+                    log.warning(f"Tuya plug unreachable for {plug_fail_count} consecutive polls")
+                    tg_send(
+                        f"⚠️ *Smart Plug UNREACHABLE*\n"
+                        f"Failed {plug_fail_count} consecutive checks.\n"
+                        f"Expected IP: {CFG['TUYA_IP']}\n"
+                        f"Check plug power / Wi-Fi / IP address."
+                    )
+                    last_plug_alert = datetime.now()
+            else:
+                plug_fail_count = 0  # reset on any successful response
 
             # Use explicit identity checks (is True / is False) so a None return
             # from plug_state() (Tuya unreachable) never triggers a spurious toggle.
@@ -820,15 +835,20 @@ def run_daemon() -> None:
             else:
                 log.info(f"🔋 {cap}% ({bat['status']}) | {bat['power_w']}W | Plug {sym}")
 
-            elapsed_h = (datetime.now() - last_alert).total_seconds() / 3600
-            if elapsed_h >= CFG["ALERT_INTERVAL_HOURS"]:
+            # Clock-aligned alert: fires at top of every Nth hour per ALERT_INTERVAL_HOURS.
+            # e.g. interval=1 → every hour; interval=2 → every 2nd hour (12AM, 2AM, 4AM...)
+            # Guard: elapsed must be within 90% of interval to handle polling jitter.
+            now = datetime.now()
+            interval_secs = CFG["ALERT_INTERVAL_HOURS"] * 3600
+            elapsed_secs  = (now - last_alert).total_seconds()
+            if now.minute == 0 and elapsed_secs >= interval_secs * 0.9:
                 tg_send(status_msg())
-                last_alert = datetime.now()
+                last_alert = now
 
             if _stop_requested.is_set():
                 log.info("🛑 /stop received — daemon loop exiting cleanly.")
                 tg_send("🛑 *Battery Manager stopped.*\nRestart with: `nohup python3 ~/battery_manager_git/battery_manager.py >> /data/battery_manager.log 2>&1 &`")
-                sys.exit(0)
+                raise _GracefulExit(0)
 
             time.sleep(CFG["POLL_INTERVAL"])
 
